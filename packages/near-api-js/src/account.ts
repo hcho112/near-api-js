@@ -31,13 +31,15 @@ import {
 } from './providers/provider';
 import { Connection } from './connection';
 import { baseDecode, baseEncode } from 'borsh';
-import { PublicKey } from './utils/key_pair';
+import { KeyPair, PublicKey } from './utils/key_pair';
 import { logWarning, PositionalArgsError } from './utils/errors';
 import { parseRpcError, parseResultError } from './utils/rpc_errors';
 import { ServerError } from './utils/rpc_errors';
-import { DEFAULT_FUNCTION_CALL_GAS, EMPTY_CONTRACT_HASH, ZERO_NEAR } from './constants';
+import { DEFAULT_FUNCTION_CALL_GAS, EMPTY_CONTRACT_HASH } from './constants';
 
 import exponentialBackoff from './utils/exponential-backoff';
+import { NEAR } from '.';
+import { parseGas, parseNEAR } from "./utils/misc";
 
 // Default number of retries with different nonce before giving up on a transaction.
 const TX_NONCE_RETRY_NUMBER = 12;
