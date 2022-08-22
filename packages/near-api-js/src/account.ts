@@ -786,4 +786,3 @@ export class Transaction {
         return this.signer.signTransaction(this.receiverId, this.actions);
     }
 }
-
