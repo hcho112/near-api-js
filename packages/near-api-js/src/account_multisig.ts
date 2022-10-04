@@ -1,7 +1,7 @@
 'use strict';
 
 import BN from 'bn.js';
-import { Account, SignAndSendTransactionOptions } from './account';
+import { Account } from './account';
 import { Connection } from './connection';
 import { parseNearAmount } from './utils/format';
 import { PublicKey } from './utils/key_pair';
@@ -9,6 +9,7 @@ import { Action, addKey, deleteKey, deployContract, fullAccessKey, functionCall,
 import { FinalExecutionOutcome, TypedError } from './providers';
 import { fetchJson } from './utils/web';
 import { FunctionCallPermissionView } from './providers/provider';
+import { SignAndSendTransactionOptions } from './transaction_sender';
 
 export const MULTISIG_STORAGE_KEY = '__multisigRequest';
 export const MULTISIG_ALLOWANCE = new BN(parseNearAmount('1'));

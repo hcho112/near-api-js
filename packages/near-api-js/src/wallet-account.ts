@@ -6,7 +6,7 @@
  * 
  * @module walletAccount
  */
-import { Account, SignAndSendTransactionOptions } from './account';
+import { Account } from './account';
 import { Near } from './near';
 import { KeyStore } from './key_stores';
 import { FinalExecutionOutcome } from './providers';
@@ -17,6 +17,7 @@ import { baseDecode } from 'borsh';
 import { Connection } from './connection';
 import { serialize } from 'borsh';
 import BN from 'bn.js';
+import { SignAndSendTransactionOptions } from './transaction_sender';
 
 const LOGIN_WALLET_URL_SUFFIX = '/login/';
 const MULTISIG_HAS_METHOD = 'add_request_and_confirm';
