@@ -3,7 +3,6 @@ import BN from 'bn.js';
 import {
     transfer,
     createAccount,
-    signTransaction,
     deployContract,
     addKey,
     functionCall,
@@ -12,17 +11,13 @@ import {
     deleteKey,
     stake,
     deleteAccount,
-    Action,
-    SignedTransaction,
-    stringifyJsonOrBytes,
-    AccessKey
+    stringifyJsonOrBytes
 } from './transaction';
-import { FinalExecutionOutcome, TypedError, ErrorContext } from './providers';
+import { TransactionSender } from './transaction_sender';
+import { FinalExecutionOutcome } from './providers';
 import {
     ViewStateResult,
     AccountView,
-    AccessKeyView,
-    AccessKeyViewRaw,
     CodeResult,
     AccessKeyList,
     AccessKeyInfoView,
@@ -30,23 +25,10 @@ import {
     BlockReference
 } from './providers/provider';
 import { Connection } from './connection';
-import { baseDecode, baseEncode } from 'borsh';
 import { PublicKey } from './utils/key_pair';
-import { logWarning, PositionalArgsError } from './utils/errors';
-import { parseRpcError, parseResultError } from './utils/rpc_errors';
-import { ServerError } from './utils/rpc_errors';
-import { DEFAULT_FUNCTION_CALL_GAS, EMPTY_CONTRACT_HASH, ZERO_NEAR } from './constants';
-
-import exponentialBackoff from './utils/exponential-backoff';
-
-// Default number of retries with different nonce before giving up on a transaction.
-const TX_NONCE_RETRY_NUMBER = 12;
-
-// Default wait until next retry in millis.
-const TX_NONCE_RETRY_WAIT = 500;
-
-// Exponential back off for waiting to retry.
-const TX_NONCE_RETRY_WAIT_BACKOFF = 1.5;
+import { PositionalArgsError } from './utils/errors';
+import { DEFAULT_FUNCTION_CALL_GAS, EMPTY_CONTRACT_HASH } from './constants';
+import { TransactionBuilder } from './transaction_builder';
 
 export interface AccountBalance {
     total: string;
@@ -59,25 +41,6 @@ export interface AccountAuthorizedApp {
     contractId: string;
     amount: string;
     publicKey: string;
-}
-
-/**
- * Options used to initiate sining and sending transactions
- */
-export interface SignAndSendTransactionOptions {
-    receiverId: string;
-    actions: Action[];
-    /**
-     * Metadata to send the NEAR Wallet if using it to sign transactions.
-     * @see {@link RequestSignTransactionsOptions}
-     */
-    walletMeta?: string;
-    /**
-     * Callback url to send the NEAR Wallet if using it to sign transactions.
-     * @see {@link RequestSignTransactionsOptions}
-     */
-    walletCallbackUrl?: string;
-    returnError?: boolean;
 }
 
 /**
@@ -124,12 +87,6 @@ export interface ViewFunctionCallOptions extends FunctionCallOptions {
     blockQuery?: BlockReference; 
 }
 
-interface ReceiptLogWithFailure {
-    receiptIds: [string];
-    logs: [string];
-    failure: ServerError;
-}
-
 interface StakedBalance {
     validatorId: string;
     amount?: string;
@@ -157,11 +114,12 @@ function bytesJsonStringify(input: any): Buffer {
  * @see [https://docs.near.org/docs/develop/front-end/naj-quick-reference#account](https://docs.near.org/tools/near-api-js/quick-reference#account)
  * @see [Account Spec](https://nomicon.io/DataStructures/Account.html)
  */
-export class Account {
+export class Account extends TransactionSender {
     readonly connection: Connection;
     readonly accountId: string;
 
     constructor(connection: Connection, accountId: string) {
+        super(connection, accountId);
         this.connection = connection;
         this.accountId = accountId;
     }
@@ -176,167 +134,6 @@ export class Account {
             account_id: this.accountId,
             finality: 'optimistic'
         });
-    }
-
-    /** @hidden */
-    private printLogsAndFailures(contractId: string, results: [ReceiptLogWithFailure]) {
-        if (!process.env['NEAR_NO_LOGS']) {
-            for (const result of results) {
-                console.log(`Receipt${result.receiptIds.length > 1 ? 's' : ''}: ${result.receiptIds.join(', ')}`);
-                this.printLogs(contractId, result.logs, '\t');
-                if (result.failure) {
-                    console.warn(`\tFailure [${contractId}]: ${result.failure}`);
-                }
-            }
-        }
-    }
-
-    /** @hidden */
-    private printLogs(contractId: string, logs: string[], prefix = '') {
-        if (!process.env['NEAR_NO_LOGS']) {
-            for (const log of logs) {
-                console.log(`${prefix}Log [${contractId}]: ${log}`);
-            }
-        }
-    }
-
-    /**
-     * Create a signed transaction which can be broadcast to the network
-     * @param receiverId NEAR account receiving the transaction
-     * @param actions list of actions to perform as part of the transaction
-     * @see {@link providers/json-rpc-provider!JsonRpcProvider#sendTransaction | JsonRpcProvider.sendTransaction}
-     */
-    protected async signTransaction(receiverId: string, actions: Action[]): Promise<[Uint8Array, SignedTransaction]> {
-        const accessKeyInfo = await this.findAccessKey(receiverId, actions);
-        if (!accessKeyInfo) {
-            throw new TypedError(`Can not sign transactions for account ${this.accountId} on network ${this.connection.networkId}, no matching key pair exists for this account`, 'KeyNotFound');
-        }
-        const { accessKey } = accessKeyInfo;
-
-        const block = await this.connection.provider.block({ finality: 'final' });
-        const blockHash = block.header.hash;
-
-        const nonce = accessKey.nonce.add(new BN(1));
-        return await signTransaction(
-            receiverId, nonce, actions, baseDecode(blockHash), this.connection.signer, this.accountId, this.connection.networkId
-        );
-    }
-
-    /**
-     * Sign a transaction to preform a list of actions and broadcast it using the RPC API.
-     * @see {@link providers/json-rpc-provider!JsonRpcProvider#sendTransaction | JsonRpcProvider.sendTransaction}
-     */
-    async signAndSendTransaction({ receiverId, actions, returnError }: SignAndSendTransactionOptions): Promise<FinalExecutionOutcome> {
-        let txHash, signedTx;
-        // TODO: TX_NONCE (different constants for different uses of exponentialBackoff?)
-        const result = await exponentialBackoff(TX_NONCE_RETRY_WAIT, TX_NONCE_RETRY_NUMBER, TX_NONCE_RETRY_WAIT_BACKOFF, async () => {
-            [txHash, signedTx] = await this.signTransaction(receiverId, actions);
-            const publicKey = signedTx.transaction.publicKey;
-
-            try {
-                return await this.connection.provider.sendTransaction(signedTx);
-            } catch (error) {
-                if (error.type === 'InvalidNonce') {
-                    logWarning(`Retrying transaction ${receiverId}:${baseEncode(txHash)} with new nonce.`);
-                    delete this.accessKeyByPublicKeyCache[publicKey.toString()];
-                    return null;
-                }
-                if (error.type === 'Expired') {
-                    logWarning(`Retrying transaction ${receiverId}:${baseEncode(txHash)} due to expired block hash`);
-                    return null;
-                }
-
-                error.context = new ErrorContext(baseEncode(txHash));
-                throw error;
-            }
-        });
-        if (!result) {
-            // TODO: This should have different code actually, as means "transaction not submitted for sure"
-            throw new TypedError('nonce retries exceeded for transaction. This usually means there are too many parallel requests with the same access key.', 'RetriesExceeded');
-        }
-
-        const flatLogs = [result.transaction_outcome, ...result.receipts_outcome].reduce((acc, it) => {
-            if (it.outcome.logs.length ||
-                (typeof it.outcome.status === 'object' && typeof it.outcome.status.Failure === 'object')) {
-                return acc.concat({
-                    'receiptIds': it.outcome.receipt_ids,
-                    'logs': it.outcome.logs,
-                    'failure': typeof it.outcome.status.Failure != 'undefined' ? parseRpcError(it.outcome.status.Failure) : null
-                });
-            } else return acc;
-        }, []);
-        this.printLogsAndFailures(signedTx.transaction.receiverId, flatLogs);
-
-        // Should be falsy if result.status.Failure is null
-        if (!returnError && typeof result.status === 'object' && typeof result.status.Failure === 'object'  && result.status.Failure !== null) {
-            // if error data has error_message and error_type properties, we consider that node returned an error in the old format
-            if (result.status.Failure.error_message && result.status.Failure.error_type) {
-                throw new TypedError(
-                    `Transaction ${result.transaction_outcome.id} failed. ${result.status.Failure.error_message}`,
-                    result.status.Failure.error_type);
-            } else {
-                throw parseResultError(result);
-            }
-        }
-        // TODO: if Tx is Unknown or Started.
-        return result;
-    }
-
-    /** @hidden */
-    accessKeyByPublicKeyCache: { [key: string]: AccessKeyView } = {};
-
-    /**
-     * Finds the {@link providers/provider!AccessKeyView} associated with the accounts {@link utils/key_pair!PublicKey} stored in the {@link key_stores/keystore!KeyStore}.
-     *
-     * @todo Find matching access key based on transaction (i.e. receiverId and actions)
-     *
-     * @param receiverId currently unused (see todo)
-     * @param actions currently unused (see todo)
-     * @returns `{ publicKey PublicKey; accessKey: AccessKeyView }`
-     */
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    async findAccessKey(receiverId: string, actions: Action[]): Promise<{ publicKey: PublicKey; accessKey: AccessKeyView }> {
-        // TODO: Find matching access key based on transaction (i.e. receiverId and actions)
-        const publicKey = await this.connection.signer.getPublicKey(this.accountId, this.connection.networkId);
-        if (!publicKey) {
-            throw new TypedError(`no matching key pair found in ${this.connection.signer}`, 'PublicKeyNotFound');
-        }
-
-        const cachedAccessKey = this.accessKeyByPublicKeyCache[publicKey.toString()];
-        if (cachedAccessKey !== undefined) {
-            return { publicKey, accessKey: cachedAccessKey };
-        }
-
-        try {
-            const rawAccessKey = await this.connection.provider.query<AccessKeyViewRaw>({
-                request_type: 'view_access_key',
-                account_id: this.accountId,
-                public_key: publicKey.toString(),
-                finality: 'optimistic'
-            });
-
-            // store nonce as BN to preserve precision on big number
-            const accessKey = {
-                ...rawAccessKey,
-                nonce: new BN(rawAccessKey.nonce),
-            };
-            // this function can be called multiple times and retrieve the same access key
-            // this checks to see if the access key was already retrieved and cached while
-            // the above network call was in flight. To keep nonce values in line, we return
-            // the cached access key.
-            if (this.accessKeyByPublicKeyCache[publicKey.toString()]) {
-                return { publicKey, accessKey: this.accessKeyByPublicKeyCache[publicKey.toString()] };
-            }
-
-            this.accessKeyByPublicKeyCache[publicKey.toString()] = accessKey;
-            return { publicKey, accessKey };
-        } catch (e) {
-            if (e.type == 'AccessKeyDoesNotExist') {
-                return null;
-            }
-
-            throw e;
-        }
     }
 
     /**
@@ -628,7 +425,7 @@ export class Account {
      * NOTE: If the tokens are delegated to a staking pool that is currently on pause or does not have enough tokens to participate in validation, they won't be accounted for.
      * @returns {Promise<ActiveDelegatedStakeBalance>}
      */
-    async getActiveDelegatedStakeBalance(): Promise<ActiveDelegatedStakeBalance>  {
+     async getActiveDelegatedStakeBalance(): Promise<ActiveDelegatedStakeBalance>  {
         const block = await this.connection.provider.block({ finality: 'final' });
         const blockHash = block.header.hash;
         const epochId = block.header.epoch_id;
@@ -689,99 +486,11 @@ export class Account {
         };
     }
 
-    createTransaction(recevier: Account | string): Transaction {
-        return new Transaction(this, recevier);
+    createTransaction(receiver: Account | string): TransactionBuilder {
+        return new TransactionBuilder(this.connection, this.accountId, typeof receiver === 'string' ? receiver : receiver.accountId);
     }
   
     async hasDeployedContract(): Promise<boolean> {
         return (await this.state()).code_hash !== EMPTY_CONTRACT_HASH;
-    }
-}
-
-
-/**
- * Transaction Builder class. Initialized to an account that will sign the final transaction
- */
-export class Transaction {
-    readonly receiverId: string;
-    readonly actions: Action[] = [];
-    private accountToBeCreated = false;
-    private _transferAmount?: BN;
-
-    constructor(private signer: Account, receiver: Account | string) {
-        this.receiverId = typeof receiver === 'string' ? receiver : receiver.accountId;
-    }
-
-    addKey(publicKey: string | PublicKey, accessKey: AccessKey = fullAccessKey()): this {
-        this.actions.push(addKey(PublicKey.from(publicKey), accessKey));
-        return this;
-    }
-
-    createAccount(): this {
-        this.accountToBeCreated = true;
-        this.actions.push(createAccount());
-        return this;
-    }
-
-    deleteAccount(beneficiaryId: string): this {
-        this.actions.push(deleteAccount(beneficiaryId));
-        return this;
-    }
-
-    deleteKey(publicKey: string | PublicKey): this {
-        this.actions.push(deleteKey(PublicKey.from(publicKey)));
-        return this;
-    }
-
-    deployContract(code: Uint8Array | Buffer): this {
-        this.actions.push(deployContract(code));
-        return this;
-    }
-
-    functionCall(
-        methodName: string,
-        args: Record<string, unknown> | Uint8Array,
-        {
-            gas = DEFAULT_FUNCTION_CALL_GAS,
-            attachedDeposit = ZERO_NEAR,
-        }: { gas?: BN; attachedDeposit?: BN } = {},
-    ): this {
-        this.actions.push(
-            functionCall(methodName, args, gas, attachedDeposit),
-        );
-        return this;
-    }
-
-    stake(amount: BN, publicKey: PublicKey | string): this {
-        this.actions.push(stake(amount, PublicKey.from(publicKey)));
-        return this;
-    }
-
-    transfer(amount: BN): this {
-        this._transferAmount = amount;
-        this.actions.push(transfer(this._transferAmount));
-        return this;
-    }
-
-    push(action: Action): this {
-        this.actions.push(action);
-        return this;
-    }
-
-    get accountCreated(): boolean {
-        return this.accountToBeCreated;
-    }
-
-    get transferAmount(): BN {
-        return this._transferAmount ?? ZERO_NEAR;
-    }
-
-    signAndSend(): Promise<FinalExecutionOutcome> {
-        return this.signer.signAndSendTransaction({ receiverId: this.receiverId, actions: this.actions });
-    }
-
-    sign(): Promise<[Uint8Array, SignedTransaction]> {
-        //@ts-expect-error is protected
-        return this.signer.signTransaction(this.receiverId, this.actions);
     }
 }
