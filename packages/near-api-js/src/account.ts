@@ -27,7 +27,7 @@ import {
 import { Connection } from './connection';
 import { PublicKey } from './utils/key_pair';
 import { PositionalArgsError } from './utils/errors';
-import { DEFAULT_FUNCTION_CALL_GAS, EMPTY_CONTRACT_HASH } from './constants';
+import { DEFAULT_FUNCTION_CALL_GAS } from './constants';
 import { TransactionBuilder } from './transaction_builder';
 
 export interface AccountBalance {
@@ -487,10 +487,10 @@ export class Account extends TransactionSender {
     }
 
     createTransaction(receiver: Account | string): TransactionBuilder {
-        return new TransactionBuilder(this.connection, this.accountId, typeof receiver === 'string' ? receiver : receiver.accountId);
-    }
-  
-    async hasDeployedContract(): Promise<boolean> {
-        return (await this.state()).code_hash !== EMPTY_CONTRACT_HASH;
+        return new TransactionBuilder({
+            connection: this.connection,
+            senderId: this.accountId,
+            receiverId: typeof receiver === 'string' ? receiver : receiver.accountId
+        });
     }
 }
